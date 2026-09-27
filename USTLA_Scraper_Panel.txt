@@ -1,0 +1,593 @@
+/* ============================================================================
+ * USTLA Auction Scraper — Control Panel UI  (v1)
+ * ----------------------------------------------------------------------------
+ * Kaise chalayen:
+ *   Chrome me  https://uls.ustla.com/research/auctions  khol kar (LOGGED IN),
+ *   F12 -> Console -> ye poora script paste -> Enter.
+ *   Screen ke top-right corner me ek control panel khul jayega. Baaki sab
+ *   usi panel ke buttons se hota hai — koi command type karne ki zaroorat nahi.
+ *
+ * Panel ke features:
+ *   • Start / Pause / Resume  (ek hi button toggle hota hai)
+ *   • Reset (zero se) aur Retry Failed
+ *   • "Saari pages" checkbox — tick = poori list; untick karo to From/To page
+ *     range daal sakte ho (kaunse page se kaunse page tak)
+ *   • Auction Type (Deed / Redeemable Deed / Lien), Status, Min/Max Sale Date
+ *   • Advanced: concurrency, speed (pace), per-page
+ *   • Live progress bars + stats (pages, details, failed, rate-limit hits, mismatches)
+ *   • Rate-limit (429) auto-backoff
+ *   • State localStorage me save — page refresh ho jaye ya tab band ho jaye,
+ *     dobara script paste karo aur "Resume" karo; jahan se ruka wahin se aage
+ *   • Download XLSX (month-wise sheets + Progress formulas) + backup CSV
+ *   • Data accuracy: har row par list-vs-detail cross-check
+ * ==========================================================================*/
+(function () {
+  'use strict';
+  if (location.hostname !== 'uls.ustla.com') { console.error('[ULS] Ye script uls.ustla.com par chalao (logged in).'); return; }
+  if (window.__ULS_APP) { window.__ULS_APP.show(); console.log('[ULS] Panel pehle se khula hai.'); return; }
+
+  // ------------------------------------------------------------ constants
+  var COLUMNS = ['County','State','Sale Start Date','Start Time','Sale End Time',
+    'Bid Award Date','Sale Duration','Sale Address','Contact','Phone #','Fax #',
+    'Email','Number of Parcels','Aggregate Sale Amount','Bid Procedures',
+    'Auction Type','Web Address'];
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var LSKEY = 'ULS_APP_STATE_V1';
+  var XLSX_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  var s2 = function (v) { return v == null ? '' : String(v).trim(); };
+
+  // ------------------------------------------------------------ state
+  // S = persisted collection state.  RUN = live run flags (not persisted).
+  var S = {
+    cfg: null,          // locked settings snapshot for the active run
+    range: null,        // {from,to} resolved page range
+    listCursor: 1,      // next list page to fetch
+    listComplete: false,
+    listMini: [],       // pruned list rows
+    det: {},            // id -> pruned detail
+    failed: [],
+    mismatches: [],
+    detailComplete: false,
+    updatedAt: null,
+  };
+  var RUN = { active: false, paused: false, phase: 'idle', count429: 0 };
+  var pauseUntil = 0;
+
+  // Test hooks (production run me chhue nahi jate)
+  var HOOK = { httpGet: null, pace: null };
+
+  // ------------------------------------------------------------ persistence
+  function saveState() {
+    S.updatedAt = Date.now();
+    try { localStorage.setItem(LSKEY, JSON.stringify(S)); return true; }
+    catch (e) { logLine('⚠ Save fail (storage full?): ' + e.message, 'warn'); return false; }
+  }
+  function loadState() {
+    try {
+      var raw = localStorage.getItem(LSKEY); if (!raw) return false;
+      var o = JSON.parse(raw); if (!o || typeof o !== 'object') return false;
+      S = Object.assign(S, o);
+      S.det = S.det || {}; S.listMini = S.listMini || []; S.failed = S.failed || []; S.mismatches = S.mismatches || [];
+      return true;
+    } catch (e) { return false; }
+  }
+  function clearState() {
+    S = { cfg: null, range: null, listCursor: 1, listComplete: false, listMini: [], det: {}, failed: [], mismatches: [], detailComplete: false, updatedAt: null };
+    try { localStorage.removeItem(LSKEY); } catch (e) {}
+  }
+
+  // ------------------------------------------------------------ HTTP (429-aware)
+  function realHttp(path) {
+    return fetch(path, { headers: { Accept: 'application/json' }, credentials: 'same-origin' })
+      .then(function (r) { return { status: r.status, ok: r.ok, json: function () { return r.json(); } }; });
+  }
+  async function apiGet(path) {
+    var http = HOOK.httpGet || realHttp;
+    for (var att = 0; att < 15; att++) {
+      var w = pauseUntil - Date.now(); if (w > 0) await sleep(w);
+      var r = await http(path);
+      if (r.status === 429) { RUN.count429++; pauseUntil = Date.now() + 4000 + Math.random() * 2000; render(); continue; }
+      if (r.status === 401 || r.status === 403) throw new Error('AUTH');
+      if (!r.ok) { if (att >= 3) throw new Error('HTTP ' + r.status); await sleep(700 * (att + 1)); continue; }
+      return r.json();
+    }
+    throw new Error('RATE_LIMITED');
+  }
+
+  // ------------------------------------------------------------ query builders
+  function listQuery(page, cfg) {
+    var p = new URLSearchParams();
+    p.set('page', page); p.set('perPage', cfg.perPage);
+    p.set('auctionTime', cfg.auctionTime);
+    p.set('purchased', 'all');
+    if (cfg.minDate) p.set('minSaleDate', cfg.minDate);
+    if (cfg.maxDate) p.set('maxSaleDate', cfg.maxDate);
+    cfg.types.forEach(function (t) { p.append('auctionTypes[]', t); });
+    p.append('sortFields[][field]', 'sale_date'); p.append('sortFields[][direction]', 'asc');
+    return '/api/research/auctions?' + p.toString();
+  }
+  function pruneList(a) {
+    return { id: a.id, c: a.countyName, s: a.stateName, d: a.saleDate, pn: a.parcelNum,
+      agg: a.aggregateSaleAmount, bp: a.bidProcedures, at: a.auctionType, st: a.saleTime };
+  }
+  function pruneDetail(d) {
+    var cd = d.countyData || {};
+    return { ssd: d.saleStartDate, sed: d.saleEndDate, st: d.saleTime, dur: d.saleDuration,
+      a1: d.saleAddress1, a2: d.saleAddress2, ct: d.saleCity, zp: d.saleZipCode,
+      sd: d.saleDate, at: d.auctionType, pn: d.parcelNum, agg: d.aggregateSaleAmount,
+      bp: d.bidProcedures, osd: d.onlineSiteDeed, osl: d.onlineSiteLien, osf: d.onlineSiteForeclosure,
+      tr: cd.currentTreasurer, ph: cd.countyPhone, fx: cd.countyFax, em: cd.countyEmail,
+      cds: cd.onlineSite, cdsd: cd.onlineSiteDeed };
+  }
+
+  // ------------------------------------------------------------ ENGINE
+  function readSettings() {
+    var g = function (id) { return document.getElementById(id); };
+    var types = [];
+    if (g('uls-t-deed').checked) types.push('Deed');
+    if (g('uls-t-rdeed').checked) types.push('Redeemable Deed');
+    if (g('uls-t-lien').checked) types.push('Lien');
+    return {
+      types: types.length ? types : ['Deed', 'Redeemable Deed'],
+      auctionTime: g('uls-status').value,
+      minDate: g('uls-min').value || '',
+      maxDate: g('uls-max').value || '',
+      allPages: g('uls-allpages').checked,
+      fromPage: Math.max(1, parseInt(g('uls-from').value, 10) || 1),
+      toPage: Math.max(1, parseInt(g('uls-to').value, 10) || 1),
+      perPage: Math.min(100, Math.max(1, parseInt(g('uls-perpage').value, 10) || 100)),
+      concurrency: Math.min(6, Math.max(1, parseInt(g('uls-conc').value, 10) || 3)),
+      pace: Math.max(0, parseInt(g('uls-pace').value, 10) || 120),
+    };
+  }
+
+  async function drive() {
+    if (RUN.active) return;
+    RUN.active = true; RUN.paused = false;
+    setBusy(true);
+    try {
+      // Fresh run? lock in settings.
+      if (!S.cfg) {
+        S.cfg = readSettings();
+        S.listCursor = S.cfg.allPages ? 1 : S.cfg.fromPage;
+        S.range = null; S.listComplete = false; S.detailComplete = false;
+        logLine('▶ Naya run: types=[' + S.cfg.types.join(', ') + '], minDate=' + (S.cfg.minDate || '—') +
+          ', pages=' + (S.cfg.allPages ? 'ALL' : (S.cfg.fromPage + '→' + S.cfg.toPage)), 'ok');
+      } else {
+        logLine('▶ Resume: ' + S.listMini.length + ' listed, ' + Object.keys(S.det).length + ' details done', 'ok');
+      }
+      var cfg = S.cfg;
+      var pace = HOOK.pace != null ? HOOK.pace : cfg.pace;
+
+      // ---------- PHASE 1: LIST ----------
+      if (!S.listComplete) {
+        RUN.phase = 'listing'; render();
+        // First page to learn totalPages / resolve range
+        if (!S.range) {
+          var firstPage = cfg.allPages ? 1 : cfg.fromPage;
+          var first = await apiGet(listQuery(firstPage, cfg));
+          var totalPages = first.pagination.totalPages;
+          S.__total = first.pagination.totalRows;
+          S.range = {
+            from: cfg.allPages ? 1 : Math.min(cfg.fromPage, totalPages),
+            to: cfg.allPages ? totalPages : Math.min(cfg.toPage, totalPages),
+          };
+          ingestList(first.auctions);
+          S.listCursor = firstPage + 1;
+          logLine('List: server par ' + S.__total + ' auctions, ' + totalPages + ' pages. Range ' + S.range.from + '→' + S.range.to, 'ok');
+          saveState(); render(); if (pace) await sleep(pace);
+        }
+        while (S.listCursor <= S.range.to) {
+          if (RUN.paused) { saveState(); return pausedExit(); }
+          var j = await apiGet(listQuery(S.listCursor, cfg));
+          ingestList(j.auctions);
+          S.listCursor++;
+          if (S.listCursor % 5 === 0 || S.listCursor > S.range.to) saveState();
+          render(); if (pace) await sleep(pace);
+        }
+        S.listComplete = true; saveState();
+        logLine('✔ List complete: ' + S.listMini.length + ' auctions', 'ok');
+      }
+
+      // ---------- PHASE 2: DETAILS ----------
+      RUN.phase = 'detailing'; render();
+      var queue = S.listMini.filter(function (a) { return !S.det[a.id]; });
+      var idx = 0, tick = 0;
+      async function worker() {
+        while (true) {
+          if (RUN.paused) return;
+          var a = queue[idx++]; if (!a) return;
+          try {
+            var d = await apiGet('/api/research/auctions/' + a.id);
+            if (String(d.saleDate) !== String(a.d) || Number(d.parcelNum == null ? 0 : d.parcelNum) !== Number(a.pn == null ? 0 : a.pn))
+              S.mismatches.push({ id: a.id, county: a.c, listDate: a.d, detDate: d.saleDate });
+            S.det[a.id] = pruneDetail(d);
+          } catch (e) {
+            if (String(e.message) === 'AUTH') throw e;
+            S.failed.push(a.id);
+          }
+          if (++tick % 25 === 0) { render(); }
+          if (tick % 150 === 0) saveState();
+          if (pace) await sleep(pace);
+        }
+      }
+      var workers = []; for (var k = 0; k < cfg.concurrency; k++) workers.push(worker());
+      await Promise.all(workers);
+      if (RUN.paused) { saveState(); return pausedExit(); }
+
+      // retry failed once (sequential, gentle)
+      if (S.failed.length) {
+        logLine('Retry: ' + S.failed.length + ' failed dobara...', 'warn');
+        var retry = S.failed.slice(); S.failed = [];
+        for (var i = 0; i < retry.length; i++) {
+          if (RUN.paused) { S.failed = S.failed.concat(retry.slice(i)); saveState(); return pausedExit(); }
+          try { S.det[retry[i]] = pruneDetail(await apiGet('/api/research/auctions/' + retry[i])); }
+          catch (e) { S.failed.push(retry[i]); }
+          render(); await sleep(Math.max(pace, 250));
+        }
+      }
+      S.detailComplete = true; saveState();
+      RUN.phase = 'done'; render();
+      logLine('✔ DONE. Details: ' + Object.keys(S.det).length + '/' + S.listMini.length +
+        ' | failed: ' + S.failed.length + ' | mismatches: ' + S.mismatches.length + ' | 429 hits: ' + RUN.count429,
+        S.failed.length ? 'warn' : 'ok');
+      if (document.getElementById('uls-autodl') && document.getElementById('uls-autodl').checked) {
+        await doExport();
+      }
+    } catch (e) {
+      RUN.phase = 'error'; render();
+      if (String(e.message) === 'AUTH') logLine('✖ Login session expire — page refresh + login, phir Resume. (Progress saved)', 'err');
+      else logLine('✖ Error: ' + e.message, 'err');
+    } finally {
+      RUN.active = false; setBusy(false); render();
+    }
+  }
+  function ingestList(arr) {
+    var have = {}; S.listMini.forEach(function (x) { have[x.id] = 1; });
+    for (var i = 0; i < arr.length; i++) if (!have[arr[i].id]) { S.listMini.push(pruneList(arr[i])); have[arr[i].id] = 1; }
+  }
+  function pausedExit() { RUN.phase = 'paused'; logLine('⏸ Paused. Data saved. "Resume" se aage chalega.', 'warn'); render(); }
+
+  // ------------------------------------------------------------ build rows
+  function buildRows() {
+    var rows = S.listMini.filter(function (a) { return S.det[a.id]; }).map(function (a) {
+      var d = S.det[a.id] || {};
+      var start = s2(d.ssd) || s2(a.d);
+      var t = new Date(start + 'T00:00:00');
+      var sheet = isNaN(t) ? 'Unknown' : MONTHS[t.getMonth()] + ' ' + t.getFullYear();
+      var pn = (d.pn != null ? d.pn : a.pn);
+      var agg = (d.agg != null ? d.agg : a.agg);
+      return { sheet: sheet, vals: [
+        s2(a.c), s2(a.s), start, s2(d.st || a.st),
+        s2(d.sed), s2(d.sd || a.d),
+        s2(d.dur), [d.a1, d.a2, d.ct, d.zp].map(s2).filter(Boolean).join(', '),
+        s2(d.tr), s2(d.ph), s2(d.fx), s2(d.em),
+        (pn === '' || pn == null) ? '' : Number(pn),
+        (s2(agg) === '') ? '' : Number(agg),
+        s2(d.bp || a.bp), s2(d.at || a.at),
+        s2(d.osd) || s2(d.osl) || s2(d.osf) || s2(d.cdsd) || s2(d.cds),
+      ] };
+    });
+    rows.sort(function (x, y) {
+      return String(x.vals[2]).localeCompare(String(y.vals[2])) ||
+             String(x.vals[1]).localeCompare(String(y.vals[1])) ||
+             String(x.vals[0]).localeCompare(String(y.vals[0]));
+    });
+    var bySheet = {};
+    rows.forEach(function (r) { (bySheet[r.sheet] = bySheet[r.sheet] || []).push(r.vals); });
+    return { rows: rows, bySheet: bySheet };
+  }
+
+  // ------------------------------------------------------------ exports
+  function ensureXLSX() {
+    if (typeof XLSX !== 'undefined') return Promise.resolve();
+    return new Promise(function (res, rej) {
+      var el = document.createElement('script'); el.src = XLSX_CDN;
+      el.onload = res; el.onerror = function () { rej(new Error('XLSX CDN blocked')); };
+      document.head.appendChild(el);
+    });
+  }
+  function triggerDownload(blob, name) {
+    var u = URL.createObjectURL(blob); var el = document.createElement('a');
+    el.href = u; el.download = name; document.body.appendChild(el); el.click();
+    setTimeout(function () { el.remove(); URL.revokeObjectURL(u); }, 8000);
+  }
+  function makeCSV(rows) {
+    var esc = function (v) { v = v == null ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    var lines = [['Sheet'].concat(COLUMNS).map(esc).join(',')];
+    rows.forEach(function (r) { lines.push([r.sheet].concat(r.vals).map(esc).join(',')); });
+    return '﻿' + lines.join('\n');
+  }
+  function makeWorkbook(bySheet) {
+    var wb = XLSX.utils.book_new();
+    var order = [];
+    for (var y = 2025, m = 8; ; m++) { if (m === 12) { m = 0; y++; } if (y === 2027) break; order.push(MONTHS[m] + ' ' + y); }
+    var extra = Object.keys(bySheet).filter(function (k) { return order.indexOf(k) < 0; }).sort();
+    var finalOrder = order.concat(extra);
+    var prog = [['US Tax Deed Auctions - Database Build'],
+      ['Source: uls.ustla.com research portal — panel export, ' + new Date().toISOString().slice(0, 10)], [],
+      ['Month', 'Auctions Entered', 'Total Parcels', 'Total Sale Amount']];
+    finalOrder.forEach(function (nm) {
+      prog.push([nm, { t: 'n', f: "COUNTA('" + nm + "'!A2:A2000)" }, { t: 'n', f: "SUM('" + nm + "'!M2:M2000)" }, { t: 'n', f: "SUM('" + nm + "'!N2:N2000)" }]);
+    });
+    var last = 4 + finalOrder.length;
+    prog.push([], ['TOTAL', { t: 'n', f: 'SUM(B5:B' + last + ')' }, { t: 'n', f: 'SUM(C5:C' + last + ')' }, { t: 'n', f: 'SUM(D5:D' + last + ')' }]);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(prog), 'Progress');
+    var widths = [18, 14, 14, 10, 14, 14, 16, 42, 22, 16, 14, 30, 10, 16, 24, 16, 38];
+    finalOrder.forEach(function (nm) {
+      var ws = XLSX.utils.aoa_to_sheet([COLUMNS].concat(bySheet[nm] || []));
+      ws['!cols'] = widths.map(function (wch) { return { wch: wch }; });
+      XLSX.utils.book_append_sheet(wb, ws, nm.slice(0, 31));
+    });
+    return wb;
+  }
+  async function doExport() {
+    var built = buildRows();
+    if (!built.rows.length) { logLine('Kuch export karne ko nahi — pehle scrape chalao.', 'warn'); return; }
+    triggerDownload(new Blob([makeCSV(built.rows)], { type: 'text/csv;charset=utf-8' }), 'ustla_auctions_backup.csv');
+    try {
+      await ensureXLSX();
+      var wb = makeWorkbook(built.bySheet);
+      XLSX.writeFile(wb, 'USTLA_Auctions_Filled.xlsx');
+      var months = Object.keys(built.bySheet).length;
+      logLine('⬇ Download: XLSX (' + built.rows.length + ' rows, ' + months + ' months) + CSV backup.', 'ok');
+    } catch (e) { logLine('XLSX fail (' + e.message + ') — CSV backup phir bhi mil gaya.', 'warn'); }
+  }
+
+  // ============================================================ UI
+  var el = {};
+  function css(node, obj) { for (var k in obj) node.style[k] = obj[k]; return node; }
+
+  function buildPanel() {
+    var wrap = document.createElement('div');
+    wrap.id = 'uls-panel';
+    wrap.innerHTML = PANEL_HTML();
+    document.body.appendChild(wrap);
+    injectStyle();
+
+    el.header = document.getElementById('uls-header');
+    el.body = document.getElementById('uls-body');
+    el.log = document.getElementById('uls-log');
+    el.startBtn = document.getElementById('uls-start');
+
+    // drag by header
+    (function () {
+      var ox = 0, oy = 0, dragging = false;
+      el.header.addEventListener('mousedown', function (e) {
+        if (e.target.closest('.uls-hbtn')) return;
+        dragging = true; var r = wrap.getBoundingClientRect(); ox = e.clientX - r.left; oy = e.clientY - r.top;
+        document.body.style.userSelect = 'none';
+      });
+      window.addEventListener('mousemove', function (e) {
+        if (!dragging) return;
+        wrap.style.left = Math.max(0, Math.min(window.innerWidth - 60, e.clientX - ox)) + 'px';
+        wrap.style.top = Math.max(0, Math.min(window.innerHeight - 30, e.clientY - oy)) + 'px';
+        wrap.style.right = 'auto';
+      });
+      window.addEventListener('mouseup', function () { dragging = false; document.body.style.userSelect = ''; });
+    })();
+
+    // wire buttons
+    el.startBtn.onclick = onStartPause;
+    document.getElementById('uls-reset').onclick = onReset;
+    document.getElementById('uls-retry').onclick = onRetry;
+    document.getElementById('uls-dl').onclick = function () { doExport(); };
+    document.getElementById('uls-minbtn').onclick = toggleMin;
+    document.getElementById('uls-close').onclick = function () { wrap.remove(); delete window.__ULS_APP; delete window.ULS; };
+    document.getElementById('uls-adv-toggle').onclick = function () {
+      var a = document.getElementById('uls-adv'); a.style.display = a.style.display === 'none' ? 'block' : 'none';
+    };
+    document.getElementById('uls-allpages').onchange = syncPageRange;
+    syncPageRange();
+    render();
+  }
+
+  function syncPageRange() {
+    var on = document.getElementById('uls-allpages').checked;
+    document.getElementById('uls-range').style.display = on ? 'none' : 'flex';
+  }
+  function toggleMin() {
+    var b = el.body; b.style.display = b.style.display === 'none' ? 'block' : 'none';
+    document.getElementById('uls-minbtn').textContent = b.style.display === 'none' ? '▢' : '—';
+  }
+
+  function onStartPause() {
+    if (RUN.active && !RUN.paused) { RUN.paused = true; logLine('⏸ Pause request... (current request finish ho kar rukega)', 'warn'); render(); return; }
+    if (S.detailComplete && !S.listMini.filter(function (a) { return !S.det[a.id]; }).length) {
+      logLine('Already complete. Naya data chahiye to Reset karo. Abhi Download kar sakte ho.', 'warn'); return;
+    }
+    drive();
+  }
+  function onReset() {
+    if (RUN.active) { logLine('Pehle Pause karo, phir Reset.', 'warn'); return; }
+    if (!confirm('[ULS] Reset: saara collected data mit jayega, scrape zero se shuru hoga. Pakka?')) return;
+    clearState(); RUN.count429 = 0; RUN.phase = 'idle';
+    logLine('↺ Reset done. Settings set karke Start dabao.', 'ok'); render();
+  }
+  function onRetry() {
+    if (RUN.active) { logLine('Run chal raha hai — abhi retry ki zaroorat nahi.', 'warn'); return; }
+    var missing = S.listMini.filter(function (a) { return !S.det[a.id]; }).length;
+    if (!missing) { logLine('Koi missing detail nahi — sab complete.', 'ok'); return; }
+    S.detailComplete = false;
+    logLine('Retry: ' + missing + ' missing details dobara...', 'warn');
+    drive();
+  }
+
+  function setBusy(b) {
+    var inputs = document.querySelectorAll('#uls-settings input, #uls-settings select');
+    inputs.forEach(function (i) { i.disabled = b || !!S.cfg; });
+    document.getElementById('uls-reset').disabled = b;
+  }
+
+  function pct(done, total) { return total > 0 ? Math.round(done / total * 100) : 0; }
+  function render() {
+    if (!el.body) return;
+    var listed = S.listMini.length;
+    var totalRows = S.__total || (S.range ? '?' : '?');
+    var detDone = Object.keys(S.det).length;
+    var listPages = S.range ? (S.listComplete ? (S.range.to - S.range.from + 1) : Math.max(0, S.listCursor - S.range.from)) : 0;
+    var listPagesTotal = S.range ? (S.range.to - S.range.from + 1) : 0;
+    var g = function (id) { return document.getElementById(id); };
+    // phase badge
+    var badge = g('uls-phase');
+    var map = { idle: ['Idle', '#888'], listing: ['Listing…', '#e8a02c'], detailing: ['Fetching details…', '#2c8fe8'], paused: ['Paused', '#e8a02c'], done: ['Done ✔', '#2ec27e'], error: ['Error', '#e8503c'] };
+    var ph = map[RUN.phase] || map.idle;
+    badge.textContent = ph[0]; badge.style.background = ph[1];
+    // bars
+    g('uls-bar-list').style.width = pct(listPages, listPagesTotal) + '%';
+    g('uls-bar-det').style.width = pct(detDone, listed) + '%';
+    g('uls-lbl-list').textContent = 'List pages: ' + listPages + '/' + (listPagesTotal || '?') + (S.__total ? '  (' + listed + ' auctions)' : '');
+    g('uls-lbl-det').textContent = 'Details: ' + detDone + '/' + (listed || '?');
+    // stats
+    g('uls-stats').innerHTML =
+      stat('Auctions', listed) + stat('Details', detDone) +
+      stat('Failed', S.failed.length, S.failed.length ? '#e8a02c' : '') +
+      stat('429 hits', RUN.count429, RUN.count429 ? '#e8a02c' : '') +
+      stat('Mismatch', S.mismatches.length, S.mismatches.length ? '#e8a02c' : '') +
+      stat('Saved', S.updatedAt ? new Date(S.updatedAt).toLocaleTimeString() : '—');
+    // start button label
+    var b = el.startBtn;
+    if (RUN.active && !RUN.paused) { b.textContent = '⏸ Pause'; b.className = 'uls-btn uls-warn'; }
+    else if (S.cfg && !S.detailComplete) { b.textContent = '▶ Resume'; b.className = 'uls-btn uls-go'; }
+    else if (S.detailComplete) { b.textContent = '✔ Done'; b.className = 'uls-btn uls-go'; }
+    else { b.textContent = '▶ Start'; b.className = 'uls-btn uls-go'; }
+    g('uls-dl').disabled = detDone === 0;
+    g('uls-retry').disabled = RUN.active || !(S.listMini.length && S.listMini.filter(function (a) { return !S.det[a.id]; }).length);
+  }
+  function stat(k, v, color) {
+    return '<div class="uls-stat"><div class="uls-stat-v" style="' + (color ? 'color:' + color : '') + '">' + v + '</div><div class="uls-stat-k">' + k + '</div></div>';
+  }
+  function logLine(msg, kind) {
+    if (!el.log) { console.log('[ULS] ' + msg); return; }
+    var c = kind === 'err' ? '#ff6b5e' : kind === 'warn' ? '#ffcf6b' : kind === 'ok' ? '#6bffb0' : '#cfd8e3';
+    var line = document.createElement('div');
+    line.style.color = c;
+    line.textContent = new Date().toLocaleTimeString().slice(0, 8) + '  ' + msg;
+    el.log.appendChild(line);
+    while (el.log.childNodes.length > 200) el.log.removeChild(el.log.firstChild);
+    el.log.scrollTop = el.log.scrollHeight;
+    console.log('[ULS] ' + msg);
+  }
+
+  // ------------------------------------------------------------ markup + styles
+  function PANEL_HTML() {
+    return '' +
+    '<div id="uls-header">' +
+      '<span id="uls-title">🏛 USTLA Scraper</span>' +
+      '<span id="uls-phase" class="uls-badge">Idle</span>' +
+      '<span style="flex:1"></span>' +
+      '<button id="uls-minbtn" class="uls-hbtn" title="Minimize">—</button>' +
+      '<button id="uls-close" class="uls-hbtn" title="Close">✕</button>' +
+    '</div>' +
+    '<div id="uls-body">' +
+      '<div id="uls-settings">' +
+        '<div class="uls-row"><b>Auction Type</b></div>' +
+        '<div class="uls-row uls-checks">' +
+          '<label><input type="checkbox" id="uls-t-deed" checked> Deed</label>' +
+          '<label><input type="checkbox" id="uls-t-rdeed" checked> Redeemable Deed</label>' +
+          '<label><input type="checkbox" id="uls-t-lien"> Lien</label>' +
+        '</div>' +
+        '<div class="uls-row uls-2col">' +
+          '<label>Status<select id="uls-status"><option value="all" selected>Current+Future & Past</option><option value="future">Current & Future</option><option value="past">Past</option></select></label>' +
+          '<label>Min Sale Date<input type="date" id="uls-min" value="2025-09-01"></label>' +
+        '</div>' +
+        '<div class="uls-row uls-2col">' +
+          '<label>Max Sale Date (optional)<input type="date" id="uls-max"></label>' +
+          '<label class="uls-inline"><input type="checkbox" id="uls-allpages" checked> Saari pages (all)</label>' +
+        '</div>' +
+        '<div class="uls-row" id="uls-range" style="display:none">' +
+          '<label>From page<input type="number" id="uls-from" min="1" value="1"></label>' +
+          '<label>To page<input type="number" id="uls-to" min="1" value="1"></label>' +
+        '</div>' +
+        '<div class="uls-row"><a id="uls-adv-toggle" class="uls-link">⚙ Advanced ▾</a></div>' +
+        '<div id="uls-adv" style="display:none">' +
+          '<div class="uls-row uls-3col">' +
+            '<label>Concurrency<input type="number" id="uls-conc" min="1" max="6" value="3"></label>' +
+            '<label>Speed (ms)<input type="number" id="uls-pace" min="0" value="120"></label>' +
+            '<label>Per page<input type="number" id="uls-perpage" min="1" max="100" value="100"></label>' +
+          '</div>' +
+          '<div class="uls-note">Concurrency 3 se zyada par site rate-limit (429) deti hai. Zaroorat ho to hi barhao.</div>' +
+        '</div>' +
+      '</div>' +
+      '<div id="uls-progress">' +
+        '<div class="uls-plabel" id="uls-lbl-list">List pages: 0/?</div>' +
+        '<div class="uls-track"><div id="uls-bar-list" class="uls-fill"></div></div>' +
+        '<div class="uls-plabel" id="uls-lbl-det">Details: 0/?</div>' +
+        '<div class="uls-track"><div id="uls-bar-det" class="uls-fill uls-fill2"></div></div>' +
+        '<div id="uls-stats"></div>' +
+      '</div>' +
+      '<div id="uls-controls">' +
+        '<button id="uls-start" class="uls-btn uls-go">▶ Start</button>' +
+        '<button id="uls-retry" class="uls-btn">↻ Retry failed</button>' +
+        '<button id="uls-reset" class="uls-btn uls-danger">↺ Reset</button>' +
+        '<button id="uls-dl" class="uls-btn uls-blue">⬇ Download</button>' +
+        '<label class="uls-inline uls-auto"><input type="checkbox" id="uls-autodl" checked> auto-download on finish</label>' +
+      '</div>' +
+      '<div id="uls-log"></div>' +
+    '</div>';
+  }
+  function injectStyle() {
+    if (document.getElementById('uls-style')) return;
+    var st = document.createElement('style'); st.id = 'uls-style';
+    st.textContent =
+    '#uls-panel{position:fixed;top:12px;right:12px;width:360px;z-index:2147483647;background:#161b22;color:#e6edf3;' +
+    'font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;border:1px solid #30363d;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.5);overflow:hidden}' +
+    '#uls-header{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#1f6feb;cursor:move;user-select:none}' +
+    '#uls-title{font-weight:700}' +
+    '.uls-badge{font-size:11px;padding:1px 8px;border-radius:10px;color:#fff;background:#888}' +
+    '.uls-hbtn{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:5px;width:24px;height:22px;cursor:pointer;font-size:13px}' +
+    '.uls-hbtn:hover{background:rgba(255,255,255,.3)}' +
+    '#uls-body{padding:10px;max-height:78vh;overflow:auto}' +
+    '#uls-settings .uls-row{margin:6px 0}' +
+    '.uls-checks{display:flex;flex-wrap:wrap;gap:10px}' +
+    '.uls-checks label,.uls-inline{display:flex;align-items:center;gap:5px;font-size:12px}' +
+    '.uls-2col{display:flex;gap:10px}.uls-2col>label{flex:1}' +
+    '.uls-3col{display:flex;gap:8px}.uls-3col>label{flex:1}' +
+    '#uls-range{display:flex;gap:10px}#uls-range>label{flex:1}' +
+    '#uls-settings label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:#9aa7b4}' +
+    '#uls-settings label.uls-inline{flex-direction:row;color:#e6edf3;align-self:end;padding-bottom:6px}' +
+    '#uls-settings input,#uls-settings select{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:5px 6px;font-size:12px}' +
+    '#uls-settings input[type=checkbox]{width:auto}' +
+    '.uls-link{color:#58a6ff;cursor:pointer;font-size:12px}' +
+    '.uls-note{font-size:11px;color:#8b949e;margin-top:4px}' +
+    '#uls-progress{margin:10px 0;padding:10px;background:#0d1117;border-radius:8px}' +
+    '.uls-plabel{font-size:11px;color:#9aa7b4;margin:2px 0}' +
+    '.uls-track{height:8px;background:#21262d;border-radius:5px;overflow:hidden;margin-bottom:6px}' +
+    '.uls-fill{height:100%;width:0;background:#e8a02c;transition:width .3s}' +
+    '.uls-fill2{background:#2c8fe8}' +
+    '#uls-stats{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}' +
+    '.uls-stat{flex:1;min-width:52px;text-align:center;background:#161b22;border:1px solid #21262d;border-radius:6px;padding:4px}' +
+    '.uls-stat-v{font-weight:700;font-size:13px}.uls-stat-k{font-size:10px;color:#8b949e}' +
+    '#uls-controls{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}' +
+    '.uls-btn{border:0;border-radius:7px;padding:8px 10px;cursor:pointer;font-weight:600;font-size:12px;background:#30363d;color:#e6edf3}' +
+    '.uls-btn:hover{filter:brightness(1.15)}.uls-btn:disabled{opacity:.4;cursor:not-allowed}' +
+    '.uls-go{background:#238636;color:#fff}.uls-warn{background:#e8a02c;color:#1b1b1b}.uls-danger{background:#3d1d1d;color:#ff9c8f}.uls-blue{background:#1f6feb;color:#fff}' +
+    '.uls-auto{font-size:11px;color:#9aa7b4;margin-left:auto}' +
+    '#uls-log{height:120px;overflow:auto;background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:6px;font:11px/1.5 ui-monospace,Menlo,Consolas,monospace}';
+    document.head.appendChild(st);
+  }
+
+  // ------------------------------------------------------------ boot
+  var resumed = loadState();
+  buildPanel();
+  if (resumed && S.listMini.length) {
+    logLine('↻ Pichhla data mila: ' + S.listMini.length + ' auctions, ' + Object.keys(S.det).length + ' details. "Resume" se aage chalao ya "Download" karo.', 'ok');
+    if (S.cfg) { RUN.phase = S.detailComplete ? 'done' : 'paused'; setBusy(false); }
+  } else {
+    logLine('Ready. Settings check karke ▶ Start dabao. Filters yahin panel se set hote hain — page ke apne filters ki zaroorat nahi.', 'ok');
+  }
+  render();
+
+  // ------------------------------------------------------------ public + test API
+  window.__ULS_APP = {
+    show: function () { var p = document.getElementById('uls-panel'); if (p) p.style.display = 'block'; },
+    start: drive, pause: function () { RUN.paused = true; },
+    reset: function () { clearState(); render(); },
+    state: function () { return { phase: RUN.phase, active: RUN.active, paused: RUN.paused, listed: S.listMini.length, details: Object.keys(S.det).length, failed: S.failed.length, mismatches: S.mismatches.length, count429: RUN.count429, listComplete: S.listComplete, detailComplete: S.detailComplete }; },
+    _S: function () { return S; }, _RUN: function () { return RUN; },
+    _hook: HOOK, _buildRows: buildRows, _makeWorkbook: makeWorkbook, _makeCSV: makeCSV,
+    _readSettings: readSettings, _loadState: loadState, _saveState: saveState,
+  };
+  window.ULS = window.__ULS_APP;
+})();

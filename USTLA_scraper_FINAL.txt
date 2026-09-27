@@ -1,0 +1,242 @@
+/**
+ * USTLA Auctions -> Excel Workbook  (console script)  — v3 FINAL
+ * ----------------------------------------------------------------
+ * Kahan chalana hai: Chrome me https://uls.ustla.com/research/auctions
+ * khol kar (logged in), F12 -> Console -> ye poora script paste -> Enter.
+ *
+ * NOTE: Page par UI filters lagane ki ZAROORAT NAHI hai — script apne
+ * filters khud API ko bhejta hai:
+ *   Auction Type: Deed + Redeemable Deed (Lien excluded)
+ *   Status: Current & Future + Past dono | States: saari | Venue: sab
+ *   Min Sale Date: 09/01/2025
+ *
+ * Kya karta hai:
+ *   1. Auction list API se saare pages utarta hai (100 per page).
+ *   2. Har auction ka detail endpoint hit karta hai (Contact/Phone/Fax/
+ *      Email/Address/Duration/Web Address wahin se milte hain).
+ *   3. Detail ko list ke saath cross-check karta hai (ghalat data guard),
+ *      429 rate-limit par khud ruk kar dobara try karta hai.
+ *   4. "USTLA_Auctions_Filled.xlsx" download karta hai — month-wise sheets
+ *      (Sep 2025 ... Dec 2026), wahi 17 columns jo sample workbook me hain,
+ *      + Progress sheet (formulas ke saath). Backup CSV bhi deta hai.
+ *
+ * Resume: Har 200 details par progress sessionStorage me save hota hai —
+ * agar page refresh ho jaye ya script dobara paste karo to jahan tak
+ * pahuncha tha wahin se aage chalta hai (dobara fetch nahi karta).
+ * Fresh start chahiye ho to pehle:  ULS.reset()   phir script dobara.
+ * Sirf dobara files banani hon (bina fetch):  ULS.rebuild()
+ *
+ * TEST MODE (script ko chhota kar ke aazmane ke liye, download ke baghair):
+ *   window.ULS_CFG = { MAX_LIST_PAGES: 1, MAX_DETAILS: 15, DRY_RUN: true };
+ *   ...phir script paste karo. Result window.ULS.rows me dikh jayega.
+ *   Full run se pehle ULS_CFG hata do:  delete window.ULS_CFG
+ */
+(async function () {
+  'use strict';
+
+  // ======================= CONFIG =======================
+  const CFG = Object.assign({
+    MIN_SALE_DATE: '2025-09-01',
+    AUCTION_TYPES: ['Deed', 'Redeemable Deed'],   // Lien excluded
+    PER_PAGE: 100,
+    CONCURRENCY: 3,          // 3 se zyada par site 429 (rate limit) deti hai
+    PACE_MS: 120,            // har request ke beech gap
+    RETRIES: 3,
+    MAX_LIST_PAGES: Infinity,  // TEST: chhota number
+    MAX_DETAILS: Infinity,     // TEST: chhota number
+    DRY_RUN: false,            // TEST: true => koi file download nahi hoti
+    XLSX_CDN: 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+  }, window.ULS_CFG || {});
+  const TEST = CFG.DRY_RUN || CFG.MAX_LIST_PAGES !== Infinity || CFG.MAX_DETAILS !== Infinity;
+
+  const COLUMNS = ['County','State','Sale Start Date','Start Time','Sale End Time',
+    'Bid Award Date','Sale Duration','Sale Address','Contact','Phone #','Fax #',
+    'Email','Number of Parcels','Aggregate Sale Amount','Bid Procedures',
+    'Auction Type','Web Address'];
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const log = (m, c) => console.log('%c[ULS] ' + m, 'color:' + (c || '#2a7') + ';font-weight:bold');
+
+  if (location.hostname !== 'uls.ustla.com') {
+    console.error('%c[ULS] Ye script uls.ustla.com par chalao (research portal me login karke).', 'color:red;font-weight:bold');
+    return;
+  }
+  if (window.__ULS_RUNNING) {
+    console.warn('[ULS] Pichhla run abhi chal raha hai — dobara paste mat karo. Progress: ULS.state()');
+    return;
+  }
+  window.__ULS_RUNNING = true;
+
+  // ---------- persistent state (refresh-proof) ----------
+  const SKEY_LIST = 'ULS_LIST_V3', SKEY_DET = 'ULS_DET_V3';
+  const S = { list: null, det: {}, failed: [], mismatches: [] };
+  if (!TEST) {
+    try { S.list = JSON.parse(sessionStorage.getItem(SKEY_LIST) || 'null'); } catch (e) {}
+    try { S.det = JSON.parse(sessionStorage.getItem(SKEY_DET) || '{}'); } catch (e) {}
+  }
+  const persist = () => { if (TEST) return; try {
+    sessionStorage.setItem(SKEY_LIST, JSON.stringify(S.list));
+    sessionStorage.setItem(SKEY_DET, JSON.stringify(S.det));
+  } catch (e) { console.warn('[ULS] sessionStorage full — resume partial rahega:', e.message); } };
+
+  // ---------- API with 429-aware global backoff ----------
+  let pauseUntil = 0, count429 = 0;
+  async function apiGet(path) {
+    for (let att = 0; att < 15; att++) {
+      const w = pauseUntil - Date.now(); if (w > 0) await new Promise(r => setTimeout(r, w));
+      const r = await fetch(path, { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+      if (r.status === 429) { count429++; pauseUntil = Date.now() + 4000 + Math.random() * 2000; continue; }
+      if (r.status === 401 || r.status === 403) throw new Error('AUTH');
+      if (!r.ok) { if (att >= CFG.RETRIES) throw new Error('HTTP ' + r.status); await new Promise(x => setTimeout(x, 700 * (att + 1))); continue; }
+      return r.json();
+    }
+    throw new Error('RATE_LIMITED');
+  }
+  const listQuery = (pg) => {
+    const p = new URLSearchParams();
+    p.set('page', pg); p.set('perPage', CFG.PER_PAGE);
+    p.set('auctionTime', 'all');                 // Current & Future + Past
+    p.set('purchased', 'all');
+    p.set('minSaleDate', CFG.MIN_SALE_DATE);
+    CFG.AUCTION_TYPES.forEach(t => p.append('auctionTypes[]', t));
+    p.append('sortFields[][field]', 'sale_date'); p.append('sortFields[][direction]', 'asc');
+    return '/api/research/auctions?' + p.toString();
+  };
+  // detail me se sirf zaroori fields (chhota rakhne ke liye — resume storage)
+  const prune = (d) => { const cd = d.countyData || {}; return {
+    ssd: d.saleStartDate, sed: d.saleEndDate, st: d.saleTime, dur: d.saleDuration,
+    a1: d.saleAddress1, a2: d.saleAddress2, ct: d.saleCity, zp: d.saleZipCode,
+    sd: d.saleDate, at: d.auctionType, pn: d.parcelNum, agg: d.aggregateSaleAmount,
+    bp: d.bidProcedures, osd: d.onlineSiteDeed, osl: d.onlineSiteLien, osf: d.onlineSiteForeclosure,
+    tr: cd.currentTreasurer, ph: cd.countyPhone, fx: cd.countyFax, em: cd.countyEmail,
+    cds: cd.onlineSite, cdsd: cd.onlineSiteDeed }; };
+
+  try {
+    // ================= PHASE 1: list =================
+    if (!S.list || !S.list.length) {
+      log('Phase 1: auction list utar rahi hai' + (TEST ? ' (TEST mode)' : '') + '...');
+      const first = await apiGet(listQuery(1));
+      const total = first.pagination.totalRows;
+      const pages = Math.min(first.pagination.totalPages, CFG.MAX_LIST_PAGES);
+      log(`Total auctions (filters ke saath): ${total} — ${first.pagination.totalPages} pages` + (TEST ? `, TEST cap: ${pages}` : ''));
+      const rows = [...first.auctions];
+      for (let pg = 2; pg <= pages; pg++) {
+        const j = await apiGet(listQuery(pg)); rows.push(...j.auctions);
+        if (pg % 5 === 0 || pg === pages) log(`  list page ${pg}/${pages}  (${rows.length} rows)`);
+        await new Promise(r => setTimeout(r, CFG.PACE_MS));
+      }
+      const seen = new Set();
+      S.list = rows.filter(a => !seen.has(a.id) && seen.add(a.id));
+      if (!TEST && S.list.length !== total) console.warn(`[ULS] WARNING: ${S.list.length} rows mile, expected ${total}.`);
+      persist();
+      log(`Phase 1 done: ${S.list.length} auctions.`);
+    } else {
+      log(`Phase 1 cache se mila (${S.list.length} auctions). Fresh chahiye to ULS.reset() karke dobara chalao.`);
+    }
+
+    // ================ PHASE 2: details ================
+    let targets = S.list.filter(a => !S.det[a.id]);
+    if (targets.length > CFG.MAX_DETAILS) targets = targets.slice(0, CFG.MAX_DETAILS);
+    const already = Object.keys(S.det).length;
+    log(`Phase 2: ${targets.length} details fetch hongi (${already} pehle se). Andaza ~${Math.ceil(targets.length * (CFG.PACE_MS + 230) / CFG.CONCURRENCY / 60000)} min.`);
+    let done = 0; S.failed = [];
+    const queue = [...targets];
+    async function worker() {
+      for (;;) {
+        const a = queue.shift(); if (!a) return;
+        try {
+          const d = await apiGet('/api/research/auctions/' + a.id);
+          // -------- accuracy cross-check vs list row --------
+          if (String(d.saleDate) !== String(a.saleDate) || Number(d.parcelNum ?? 0) !== Number(a.parcelNum ?? 0))
+            S.mismatches.push({ id: a.id, county: a.countyName, listDate: a.saleDate, detDate: d.saleDate });
+          S.det[a.id] = prune(d);
+        } catch (e) {
+          if (String(e.message) === 'AUTH') throw e;
+          S.failed.push(a.id);
+        }
+        done++;
+        if (done % 100 === 0) { log(`  details ${done}/${targets.length}  (429 hits: ${count429}, fail: ${S.failed.length})`); persist(); }
+        await new Promise(r => setTimeout(r, CFG.PACE_MS));
+      }
+    }
+    await Promise.all(Array.from({ length: CFG.CONCURRENCY }, worker));
+    // failed ka aakhri sequential retry
+    const retry = [...S.failed]; S.failed = [];
+    for (const id of retry) {
+      try { S.det[id] = prune(await apiGet('/api/research/auctions/' + id)); }
+      catch (e) { S.failed.push(id); }
+      await new Promise(r => setTimeout(r, 300));
+    }
+    persist();
+    log(`Phase 2 done. Cached total: ${Object.keys(S.det).length}, failed: ${S.failed.length}` + (S.failed.length ? ' — script DOBARA paste karo, sirf failed dobara try honge.' : ''));
+    if (S.mismatches.length) console.warn(`[ULS] ${S.mismatches.length} list/detail mismatches — ULS.data.mismatches dekho.`);
+
+    // ================ PHASE 3: rows build ================
+    const s2 = v => (v == null ? '' : String(v).trim());
+    const covered = TEST ? S.list.filter(a => S.det[a.id]) : S.list;
+    const rows = covered.map(a => { const d = S.det[a.id] || {}; return {
+      sheet: (() => { const t = new Date((s2(d.ssd) || s2(a.saleDate)) + 'T00:00:00'); return isNaN(t) ? 'Unknown' : MONTHS[t.getMonth()] + ' ' + t.getFullYear(); })(),
+      vals: [ s2(a.countyName), s2(a.stateName), s2(d.ssd) || s2(a.saleDate), s2(d.st || a.saleTime),
+        s2(d.sed), s2(d.sd || a.saleDate),   // Bid Award Date: site UI isi saleDate ko dikhata hai
+        s2(d.dur), [d.a1, d.a2, d.ct, d.zp].map(s2).filter(Boolean).join(', '),
+        s2(d.tr), s2(d.ph), s2(d.fx), s2(d.em),
+        (d.pn ?? a.parcelNum ?? '') === '' ? '' : Number(d.pn ?? a.parcelNum),
+        s2(d.agg ?? a.aggregateSaleAmount) === '' ? '' : Number(d.agg ?? a.aggregateSaleAmount),
+        s2(d.bp || a.bidProcedures), s2(d.at || a.auctionType),
+        s2(d.osd) || s2(d.osl) || s2(d.osf) || s2(d.cdsd) || s2(d.cds) ] }; });
+    rows.sort((x, y) => String(x.vals[2]).localeCompare(String(y.vals[2])) || String(x.vals[1]).localeCompare(String(y.vals[1])) || String(x.vals[0]).localeCompare(String(y.vals[0])));
+    const bySheet = {};
+    rows.forEach(r => (bySheet[r.sheet] = bySheet[r.sheet] || []).push(r.vals));
+
+    // ================ PHASE 4: export ================
+    const dl = (blob, name) => { if (CFG.DRY_RUN) { log(`DRY_RUN: ${name} banti (${(blob.size/1024).toFixed(0)} KB) — download skip.`, 'orange'); return; }
+      const u = URL.createObjectURL(blob); const el = document.createElement('a'); el.href = u; el.download = name; el.click(); setTimeout(() => URL.revokeObjectURL(u), 8000); };
+
+    // CSV (backup)
+    const esc = v => { v = v == null ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    const csvLines = [['Sheet', ...COLUMNS].map(esc).join(',')];
+    rows.forEach(r => csvLines.push([r.sheet, ...r.vals].map(esc).join(',')));
+    const csvText = '﻿' + csvLines.join('\n');
+    dl(new Blob([csvText], { type: 'text/csv;charset=utf-8' }), 'ustla_auctions_backup.csv');
+
+    // XLSX
+    if (typeof XLSX === 'undefined') {
+      await new Promise((res, rej) => { const el = document.createElement('script'); el.src = CFG.XLSX_CDN;
+        el.onload = res; el.onerror = () => rej(new Error('CDN blocked')); document.head.appendChild(el); });
+    }
+    const wb = XLSX.utils.book_new();
+    const order = [];
+    for (let y = 2025, m = 8; ; m++) { if (m === 12) { m = 0; y++; } if (y === 2027) break; order.push(MONTHS[m] + ' ' + y); }
+    const finalOrder = order.concat(Object.keys(bySheet).filter(k => !order.includes(k)).sort());
+    const prog = [['US Tax Deed Auctions - Database Build'],
+      ['Source: uls.ustla.com research portal — console export, ' + new Date().toISOString().slice(0, 10)], [],
+      ['Month', 'Auctions Entered', 'Total Parcels', 'Total Sale Amount']];
+    finalOrder.forEach(nm => prog.push([nm, { f: `COUNTA('${nm}'!A2:A2000)` }, { f: `SUM('${nm}'!M2:M2000)` }, { f: `SUM('${nm}'!N2:N2000)` }]));
+    prog.push([], ['TOTAL', { f: `SUM(B5:B${4 + finalOrder.length})` }, { f: `SUM(C5:C${4 + finalOrder.length})` }, { f: `SUM(D5:D${4 + finalOrder.length})` }]);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(prog), 'Progress');
+    const widths = [18, 14, 14, 10, 14, 14, 16, 42, 22, 16, 14, 30, 10, 16, 24, 16, 38];
+    for (const nm of finalOrder) {
+      const ws = XLSX.utils.aoa_to_sheet([COLUMNS, ...(bySheet[nm] || [])]);
+      ws['!cols'] = widths.map(wch => ({ wch }));
+      XLSX.utils.book_append_sheet(wb, ws, nm.slice(0, 31));
+    }
+    if (CFG.DRY_RUN) log(`DRY_RUN: XLSX workbook ban gayi (${finalOrder.length + 1} sheets) — download skip.`, 'orange');
+    else XLSX.writeFile(wb, 'USTLA_Auctions_Filled.xlsx');
+
+    // ================ SUMMARY + handles ================
+    window.ULS = {
+      data: S, rows, bySheet, csvText, wb,
+      state: () => ({ list: S.list ? S.list.length : 0, details: Object.keys(S.det).length, failed: S.failed.length, mismatches: S.mismatches.length, rateLimitHits: count429 }),
+      reset: () => { sessionStorage.removeItem(SKEY_LIST); sessionStorage.removeItem(SKEY_DET); delete window.__ULS_RUNNING; log('Cache clear. Ab script dobara paste karo.'); },
+      rebuild: () => { delete window.__ULS_RUNNING; log('Dobara paste karo — fetch skip hoga, files dobara banengi.'); },
+    };
+    const counts = {}; Object.keys(bySheet).sort().forEach(k => counts[k] = bySheet[k].length);
+    console.table(counts);
+    log(`DONE ✔  Rows: ${rows.length} | Detail failed: ${S.failed.length} | Mismatches: ${S.mismatches.length} | 429 hits: ${count429}`, '#27f');
+    if (S.failed.length) log('Kuch details reh gayin — script dobara paste karo, sirf wahi fetch hongi, phir poori file banegi.', 'orange');
+  } catch (e) {
+    if (String(e.message) === 'AUTH') console.error('%c[ULS] Login session expire — page refresh karke login karo, phir script dobara. (Progress saved hai)', 'color:red;font-weight:bold');
+    else console.error('[ULS] Error:', e);
+  } finally {
+    window.__ULS_RUNNING = false;
+  }
+})();

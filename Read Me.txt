@@ -1,0 +1,7 @@
+Do files bheji hain:
+
+USTLA_Scraper_Panel.js — UI wala (yehi use karein). Site pe logged-in ho kar F12 → Console → poora script paste → Enter. Top-right mein panel khul jata hai: Start/Pause/Resume, Reset (zero se), Retry failed, page range from/to ya "all pages" checkbox, speed/concurrency settings, progress bar + log, Download XLSX / CSV. Progress localStorage mein save hota hai — tab band ho jaye ya interrupt ho to dobara script paste karke Resume dabao, wahin se chalta hai.
+
+USTLA_scraper_FINAL.js — plain console version (bina panel ke), same data logic, ULS.reset() se reset.
+
+Ek zaroori baat: site abhi rate-limit block mein hai, to jab tak wo nahi khulta ye scripts bhi chal ke 429 hi khayengi. Aur jab chalayen to panel mein concurrency 2–3 aur pace 300+ ms rakhein — kal ki block isi liye lagi thi ke requests zyada tez thin. Baqi verification ab tak ke results mein 0 ghalat cell hai, to file par bharosa kar sakte hain.
